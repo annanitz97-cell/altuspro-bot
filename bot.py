@@ -76,7 +76,36 @@ def get_users():
     users = bx('user.get', {'select[]': ['ID', 'NAME', 'LAST_NAME']})
     return {u['ID']: (u.get('NAME', '') + ' ' + u.get('LAST_NAME', '')).strip() for u in users}
 
+def get_deals_for_month():
+    """Загружает сделки только за текущий месяц"""
+    deals = []
+    start = 0
+    users = get_users()
+    now = datetime.now()
+    date_from = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    date_filter = date_from.strftime('%d.%m.%Y')
+    while True:
+        params = {
+            'select[]': ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID', 'OPPORTUNITY', 'DATE_CREATE', 'CLOSEDATE', 'SOURCE_ID'],
+            'filter[>=DATE_CREATE]': date_filter,
+            'order[DATE_CREATE]': 'DESC',
+            'start': start
+        }
+        result = bx('crm.deal.list', params)
+        if not result:
+            break
+        for d in result:
+            d['MANAGER'] = users.get(d.get('ASSIGNED_BY_ID', ''), 'Не назначен')
+        deals.extend(result)
+        if len(result) < 50:
+            break
+        start += 50
+        if len(deals) > 2000:
+            break
+    return deals
+
 def get_deals():
+    """Загружает сделки за 3 месяца"""
     deals = []
     start = 0
     users = get_users()
@@ -175,6 +204,15 @@ def managers_menu(deals):
     kb.add(types.KeyboardButton('◀️ Назад'))
     return kb, managers
 
+def report_managers_menu(deals):
+    managers = get_managers_list(deals)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(types.KeyboardButton('📊 Общий отчёт (все менеджеры)'))
+    for m in managers:
+        kb.add(types.KeyboardButton(f'📋 {m}'))
+    kb.add(types.KeyboardButton('◀️ Назад'))
+    return kb
+
 def show_all(chat_id, deals, date_from, date_to):
     filtered = filter_by_period(deals, date_from, date_to)
     managers = {}
@@ -185,20 +223,15 @@ def show_all(chat_id, deals, date_from, date_to):
         sid = d.get('STAGE_ID')
         opp = float(d.get('OPPORTUNITY', 0) or 0)
         if sid == 'WON':
-            managers[m]['won_f'] += 1
-            managers[m]['revenue'] += opp
+            managers[m]['won_f'] += 1; managers[m]['revenue'] += opp
         elif sid == 'UC_ZWS97R':
-            managers[m]['won_s'] += 1
-            managers[m]['revenue'] += opp
+            managers[m]['won_s'] += 1; managers[m]['revenue'] += opp
         elif sid == 'EXECUTING':
-            managers[m]['won_p'] += 1
-            managers[m]['revenue'] += opp
+            managers[m]['won_p'] += 1; managers[m]['revenue'] += opp
         elif sid in LOST_STAGES:
             managers[m]['lost'] += 1
         elif sid in EXPECTED_STAGES:
-            managers[m]['expected'] += 1
-            managers[m]['expected_sum'] += opp
-            managers[m]['active'] += 1
+            managers[m]['expected'] += 1; managers[m]['expected_sum'] += opp; managers[m]['active'] += 1
         else:
             managers[m]['active'] += 1
 
@@ -344,7 +377,7 @@ def show_attention(chat_id, deals):
 
     bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=main_menu())
 
-def create_excel_report(deals, date_from, date_to):
+def create_manager_excel(deals, manager_name, date_from, date_to):
     wb = openpyxl.Workbook()
     BLUE = "1E3A5F"
     LIGHT_BLUE = "2E86AB"
@@ -364,126 +397,105 @@ def create_excel_report(deals, date_from, date_to):
         thin = Side(style='thin', color="CCCCCC")
         cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    filtered = filter_by_period(deals, date_from, date_to)
+    # Фильтруем по менеджеру и периоду
+    if manager_name == 'ALL':
+        filtered = filter_by_period(deals, date_from, date_to)
+        title_name = 'Все менеджеры'
+    else:
+        filtered = [d for d in deals if manager_name in d.get('MANAGER', '')]
+        filtered = filter_by_period(filtered, date_from, date_to)
+        title_name = manager_name
 
+    # Лист 1 - Сводка
     ws = wb.active
     ws.title = "Сводка"
     ws.sheet_view.showGridLines = False
 
-    ws.merge_cells('A1:M1')
-    ws['A1'] = f'ОТЧЕТ AltusPro CRM | {date_from.strftime("%d.%m.%Y")} – {date_to.strftime("%d.%m.%Y")}'
+    ws.merge_cells('A1:H1')
+    ws['A1'] = f'ОТЧЕТ AltusPro | {title_name}'
     sc(ws['A1'], bold=True, color=WHITE, bg=BLUE, size=14, align='center')
     ws.row_dimensions[1].height = 35
 
-    ws.merge_cells('A2:M2')
-    ws['A2'] = f'Сформирован: {datetime.now().strftime("%d.%m.%Y %H:%M")} | Всего сделок: {len(filtered)}'
+    ws.merge_cells('A2:H2')
+    ws['A2'] = f'{date_from.strftime("%d.%m.%Y")} – {date_to.strftime("%d.%m.%Y")} | Сформирован: {datetime.now().strftime("%d.%m.%Y %H:%M")}'
     sc(ws['A2'], color="666666", bg=LIGHT_GRAY, size=10, align='center')
     ws.row_dimensions[2].height = 18
     ws.row_dimensions[3].height = 8
 
-    headers = ['Менеджер', 'Всего', 'Сделка успешна (₽)', 'шт', 'Отгружен б/д (₽)', 'шт',
-               'Счет оплачен (₽)', 'шт', 'Итого оплат (₽)', 'Ожидаем (₽)', 'В работе', 'Провалы', 'Конверсия']
+    # Сводка по менеджеру
+    won_final = [d for d in filtered if d.get('STAGE_ID') == 'WON']
+    won_shipped = [d for d in filtered if d.get('STAGE_ID') == 'UC_ZWS97R']
+    won_paid = [d for d in filtered if d.get('STAGE_ID') == 'EXECUTING']
+    won = won_final + won_shipped + won_paid
+    lost = [d for d in filtered if d.get('STAGE_ID') in LOST_STAGES]
+    expected = [d for d in filtered if d.get('STAGE_ID') in EXPECTED_STAGES]
+    active = [d for d in filtered if d.get('STAGE_ID') not in WON_STAGES + LOST_STAGES]
 
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=4, column=col, value=h)
-        sc(cell, bold=True, color=WHITE, bg=LIGHT_BLUE, size=10, align='center', wrap=True)
-        bc(cell)
-    ws.row_dimensions[4].height = 35
+    rev_f = sum_revenue(won_final)
+    rev_s = sum_revenue(won_shipped)
+    rev_p = sum_revenue(won_paid)
+    rev_total = rev_f + rev_s + rev_p
+    rev_e = sum_revenue(expected)
+    conv = round(len(won) / max(len(filtered), 1) * 100)
 
-    managers = {}
-    for d in filtered:
-        m = d.get('MANAGER', 'Не назначен')
-        if m not in managers:
-            managers[m] = {'total': 0, 'won_f': 0, 'won_s': 0, 'won_p': 0, 'lost': 0, 'expected': 0, 'active': 0,
-                           'rev_f': 0, 'rev_s': 0, 'rev_p': 0, 'rev_e': 0}
-        sid = d.get('STAGE_ID', '')
-        opp = float(d.get('OPPORTUNITY', 0) or 0)
-        managers[m]['total'] += 1
-        if sid == 'WON':
-            managers[m]['won_f'] += 1
-            managers[m]['rev_f'] += opp
-        elif sid == 'UC_ZWS97R':
-            managers[m]['won_s'] += 1
-            managers[m]['rev_s'] += opp
-        elif sid == 'EXECUTING':
-            managers[m]['won_p'] += 1
-            managers[m]['rev_p'] += opp
-        elif sid in LOST_STAGES:
-            managers[m]['lost'] += 1
-        elif sid in EXPECTED_STAGES:
-            managers[m]['expected'] += 1
-            managers[m]['rev_e'] += opp
-            managers[m]['active'] += 1
-        else:
-            managers[m]['active'] += 1
+    summary = [
+        ('Всего сделок', len(filtered), None),
+        ('', '', None),
+        ('✅ Сделка успешна (шт)', len(won_final), None),
+        ('✅ Сделка успешна (₽)', rev_f, '#,##0 "₽"'),
+        ('📦 Отгружен без документов (шт)', len(won_shipped), None),
+        ('📦 Отгружен без документов (₽)', rev_s, '#,##0 "₽"'),
+        ('💳 Счет оплачен (шт)', len(won_paid), None),
+        ('💳 Счет оплачен (₽)', rev_p, '#,##0 "₽"'),
+        ('💰 ИТОГО ОПЛАТ (шт)', len(won), None),
+        ('💰 ИТОГО ОПЛАТ (₽)', rev_total, '#,##0 "₽"'),
+        ('', '', None),
+        ('⏳ Ожидаем оплату (шт)', len(expected), None),
+        ('⏳ Ожидаем оплату (₽)', rev_e, '#,##0 "₽"'),
+        ('', '', None),
+        ('🔄 В работе', len(active), None),
+        ('❌ Провалов', len(lost), None),
+        ('📈 Конверсия', f'{conv}%', None),
+    ]
 
-    row = 5
-    totals = {k: 0 for k in ['total', 'won_f', 'won_s', 'won_p', 'lost', 'expected', 'active', 'rev_f', 'rev_s', 'rev_p', 'rev_e']}
-
-    for name, s in sorted(managers.items(), key=lambda x: x[1]['rev_f'] + x[1]['rev_s'] + x[1]['rev_p'], reverse=True):
-        won_total = s['won_f'] + s['won_s'] + s['won_p']
-        rev_total = s['rev_f'] + s['rev_s'] + s['rev_p']
-        conv = round(won_total / max(s['total'], 1) * 100)
-        bg = WHITE if row % 2 == 0 else LIGHT_GRAY
-
-        vals = [name, s['total'], s['rev_f'], s['won_f'], s['rev_s'], s['won_s'],
-                s['rev_p'], s['won_p'], rev_total, s['rev_e'], s['active'], s['lost'], f"{conv}%"]
-
-        for col, val in enumerate(vals, 1):
-            cell = ws.cell(row=row, column=col, value=val)
-            if col in [3, 5, 7, 9]:
-                sc(cell, bg=GREEN_LIGHT, align='right')
-                if isinstance(val, (int, float)) and val > 0:
-                    cell.number_format = '#,##0 "₽"'
-            elif col == 10:
-                sc(cell, bg=YELLOW, align='right')
-                if isinstance(val, (int, float)) and val > 0:
-                    cell.number_format = '#,##0 "₽"'
-            elif col == 13:
-                color = "27AE60" if conv >= 50 else ("F39C12" if conv >= 25 else "E74C3C")
-                sc(cell, bold=True, color=color, bg=bg, align='center')
-            elif col == 1:
-                sc(cell, bold=True, bg=bg)
-            else:
-                sc(cell, bg=bg, align='center')
-            bc(cell)
-
-        for k in totals:
-            totals[k] += s[k]
+    row = 4
+    for label, value, fmt in summary:
+        if label == '':
+            row += 1
+            continue
+        cell_l = ws.cell(row=row, column=1, value=label)
+        cell_v = ws.cell(row=row, column=2, value=value)
+        is_total = 'ИТОГО' in label
+        bg = GREEN_LIGHT if 'ИТОГО' in label else (YELLOW if 'Ожидаем' in label else WHITE)
+        sc(cell_l, bold=is_total, bg=bg)
+        sc(cell_v, bold=is_total, bg=bg, align='right')
+        if fmt:
+            cell_v.number_format = fmt
+        bc(cell_l); bc(cell_v)
+        ws.row_dimensions[row].height = 22
         row += 1
 
-    won_all = totals['won_f'] + totals['won_s'] + totals['won_p']
-    rev_all = totals['rev_f'] + totals['rev_s'] + totals['rev_p']
-    conv_all = round(won_all / max(totals['total'], 1) * 100)
-    total_vals = ['ИТОГО', totals['total'], totals['rev_f'], totals['won_f'], totals['rev_s'], totals['won_s'],
-                  totals['rev_p'], totals['won_p'], rev_all, totals['rev_e'], totals['active'], totals['lost'], f"{conv_all}%"]
+    ws.column_dimensions['A'].width = 35
+    ws.column_dimensions['B'].width = 18
 
-    for col, val in enumerate(total_vals, 1):
-        cell = ws.cell(row=row, column=col, value=val)
-        sc(cell, bold=True, color=WHITE, bg=BLUE, align='center' if col > 1 else 'left')
-        if col in [3, 5, 7, 9, 10] and isinstance(val, (int, float)):
-            cell.number_format = '#,##0 "₽"'
-        bc(cell)
-    ws.row_dimensions[row].height = 25
-
-    for i, w in enumerate([22, 8, 16, 8, 16, 8, 16, 8, 16, 14, 10, 10, 10], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
-    ws2 = wb.create_sheet("Детализация")
+    # Лист 2 - Детализация сделок
+    ws2 = wb.create_sheet("Все сделки")
     ws2.sheet_view.showGridLines = False
+
     ws2.merge_cells('A1:G1')
-    ws2['A1'] = f'ДЕТАЛИЗАЦИЯ СДЕЛОК | {date_from.strftime("%d.%m.%Y")} – {date_to.strftime("%d.%m.%Y")}'
+    ws2['A1'] = f'ДЕТАЛИЗАЦИЯ | {title_name} | {date_from.strftime("%d.%m.%Y")} – {date_to.strftime("%d.%m.%Y")}'
     sc(ws2['A1'], bold=True, color=WHITE, bg=BLUE, size=13, align='center')
     ws2.row_dimensions[1].height = 30
 
-    for col, h in enumerate(['Менеджер', 'Название сделки', 'Статус', 'Сумма', 'Дата создания', 'Дней в работе', 'Источник'], 1):
+    headers = ['Менеджер', 'Название сделки', 'Статус', 'Сумма', 'Дата создания', 'Дней в работе', 'Источник']
+    for col, h in enumerate(headers, 1):
         cell = ws2.cell(row=2, column=col, value=h)
         sc(cell, bold=True, color=WHITE, bg=LIGHT_BLUE, size=10, align='center')
         bc(cell)
     ws2.row_dimensions[2].height = 25
 
     row2 = 3
-    for d in sorted(filtered, key=lambda x: (x.get('MANAGER', ''), x.get('STAGE_ID', ''))):
+    for d in sorted(filtered, key=lambda x: x.get('STAGE_ID', '')):
         sid = d.get('STAGE_ID', '')
         opp = float(d.get('OPPORTUNITY', 0) or 0)
         days = days_since(d.get('DATE_CREATE', ''))
@@ -500,11 +512,13 @@ def create_excel_report(deals, date_from, date_to):
         else:
             bg = WHITE if row2 % 2 == 0 else LIGHT_GRAY
 
-        for col, val in enumerate([d.get('MANAGER', '—'), d.get('TITLE', '—'), STAGE_NAMES.get(sid, sid),
-                                    opp if opp > 0 else None,
-                                    d.get('DATE_CREATE', '')[:10] if d.get('DATE_CREATE') else '—',
-                                    days if days < 999 else '—',
-                                    d.get('SOURCE_ID', '—') or '—'], 1):
+        vals = [d.get('MANAGER', '—'), d.get('TITLE', '—'), STAGE_NAMES.get(sid, sid),
+                opp if opp > 0 else None,
+                d.get('DATE_CREATE', '')[:10] if d.get('DATE_CREATE') else '—',
+                days if days < 999 else '—',
+                d.get('SOURCE_ID', '—') or '—']
+
+        for col, val in enumerate(vals, 1):
             cell = ws2.cell(row=row2, column=col, value=val)
             sc(cell, bg=bg, wrap=(col == 2))
             if col == 4 and val:
@@ -516,10 +530,11 @@ def create_excel_report(deals, date_from, date_to):
     for i, w in enumerate([22, 40, 22, 14, 13, 13, 12], 1):
         ws2.column_dimensions[get_column_letter(i)].width = w
 
+    # Лист 3 - Ожидаемые оплаты
     ws3 = wb.create_sheet("Ожидаемые оплаты")
     ws3.sheet_view.showGridLines = False
     ws3.merge_cells('A1:E1')
-    ws3['A1'] = 'ОЖИДАЕМЫЕ ОПЛАТЫ (Счет на предоплату)'
+    ws3['A1'] = f'ОЖИДАЕМЫЕ ОПЛАТЫ | {title_name}'
     sc(ws3['A1'], bold=True, color=WHITE, bg="E67E22", size=13, align='center')
     ws3.row_dimensions[1].height = 30
 
@@ -528,10 +543,9 @@ def create_excel_report(deals, date_from, date_to):
         sc(cell, bold=True, color=WHITE, bg=LIGHT_BLUE, size=10, align='center')
         bc(cell)
 
-    expected_all = [d for d in filtered if d.get('STAGE_ID') in EXPECTED_STAGES]
     r3 = 3
     total_exp = 0
-    for d in sorted(expected_all, key=lambda x: x.get('MANAGER', '')):
+    for d in sorted(expected, key=lambda x: x.get('MANAGER', '')):
         opp = float(d.get('OPPORTUNITY', 0) or 0)
         total_exp += opp
         days = days_since(d.get('DATE_CREATE', ''))
@@ -548,11 +562,12 @@ def create_excel_report(deals, date_from, date_to):
             bc(cell)
         r3 += 1
 
-    tcc = ws3.cell(row=r3, column=1, value='ИТОГО')
-    sc(tcc, bold=True)
-    tc = ws3.cell(row=r3, column=3, value=total_exp)
-    sc(tc, bold=True, color=WHITE, bg="E67E22", align='right')
-    tc.number_format = '#,##0 "₽"'
+    if expected:
+        tc = ws3.cell(row=r3, column=1, value='ИТОГО')
+        sc(tc, bold=True)
+        tcc = ws3.cell(row=r3, column=3, value=total_exp)
+        sc(tcc, bold=True, color=WHITE, bg="E67E22", align='right')
+        tcc.number_format = '#,##0 "₽"'
 
     for i, w in enumerate([22, 40, 16, 14, 14], 1):
         ws3.column_dimensions[get_column_letter(i)].width = w
@@ -608,6 +623,35 @@ def handle_text(message):
                                  parse_mode='Markdown', reply_markup=period_menu())
                 return
 
+        if action == 'choose_report_manager':
+            now = datetime.now()
+            date_from = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            date_to = now
+
+            if text == '📊 Общий отчёт (все менеджеры)':
+                bot.send_message(chat_id, f"⏳ Формирую общий отчёт за {date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}...")
+                deals = get_deals_for_month()
+                excel = create_manager_excel(deals, 'ALL', date_from, date_to)
+                filename = f"AltusPro_все_{date_from.strftime('%d.%m')}-{date_to.strftime('%d.%m.%Y')}.xlsx"
+                bot.send_document(chat_id, excel, visible_file_name=filename,
+                                  caption=f"📊 Общий отчёт | {date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}")
+                user_state.pop(uid, None)
+                bot.send_message(chat_id, "Главное меню 👇", reply_markup=main_menu())
+                return
+
+            if text.startswith('📋 '):
+                manager_name = text[2:].strip()
+                bot.send_message(chat_id, f"⏳ Формирую отчёт по {manager_name}...")
+                deals = get_deals_for_month()
+                excel = create_manager_excel(deals, manager_name, date_from, date_to)
+                safe_name = manager_name.replace(' ', '_')
+                filename = f"AltusPro_{safe_name}_{date_from.strftime('%d.%m')}-{date_to.strftime('%d.%m.%Y')}.xlsx"
+                bot.send_document(chat_id, excel, visible_file_name=filename,
+                                  caption=f"📋 {manager_name} | {date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}")
+                user_state.pop(uid, None)
+                bot.send_message(chat_id, "Главное меню 👇", reply_markup=main_menu())
+                return
+
     if text == '📊 Все менеджеры':
         user_state[uid] = {'action': 'all'}
         bot.send_message(chat_id, "📊 Все менеджеры\nВыбери период 👇", reply_markup=period_menu())
@@ -638,14 +682,14 @@ def handle_text(message):
         show_attention(chat_id, deals)
 
     elif text == '📋 Excel отчёт':
+        bot.send_message(chat_id, "⏳ Загружаю список менеджеров...")
+        deals = get_deals_for_month()
+        kb = report_managers_menu(deals)
+        user_state[uid] = {'action': 'choose_report_manager'}
         now = datetime.now()
-        date_from = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        bot.send_message(chat_id, f"⏳ Формирую отчет за {date_from.strftime('%d.%m')}–{now.strftime('%d.%m.%Y')}...")
-        deals = get_deals()
-        excel = create_excel_report(deals, date_from, now)
-        filename = f"AltusPro_{date_from.strftime('%d.%m')}-{now.strftime('%d.%m.%Y')}.xlsx"
-        bot.send_document(chat_id, excel, visible_file_name=filename,
-                          caption=f"📊 Отчет AltusPro CRM\n📅 {date_from.strftime('%d.%m')}–{now.strftime('%d.%m.%Y')}\n3 листа: Сводка | Детализация | Ожидаемые оплаты")
+        bot.send_message(chat_id,
+                         f"📋 *Excel отчёт* за {now.replace(day=1).strftime('%d.%m')}–{now.strftime('%d.%m.%Y')}\n\nВыбери менеджера 👇",
+                         parse_mode='Markdown', reply_markup=kb)
 
     else:
         bot.send_message(chat_id, "Используй кнопки меню 👇", reply_markup=main_menu())
