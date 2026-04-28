@@ -84,7 +84,7 @@ def get_deals():
     
     # Фильтр: только последние 3 месяца
     date_from = datetime.now() - timedelta(days=90)
-    date_filter = date_from.strftime('%Y-%m-%dT00:00:00')
+  date_filter = date_from.strftime('%d.%m.%Y')
     
     while True:
         params = {
