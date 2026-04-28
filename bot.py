@@ -20,7 +20,7 @@ STAGE_NAMES = {
     'PREPARATION': 'ТКП направлено',
     '3': 'ТКП перекупам',
     '2': 'Работа с возражениями',
-    'PREPAYMENT_INVOICE': 'Счёт на предоплату',
+    'PREPAYMENT_INVOICE': 'Счет на предоплату',
     'EXECUTING': 'В работе - счет оплачен',
     'UC_ZWS97R': 'Отгружен БЕЗ ДОКУМЕНТОВ',
     'UC_018IHX': 'ПРОРАБОТАТЬ',
@@ -31,9 +31,9 @@ STAGE_NAMES = {
     '4': 'Тендер',
     'UC_WLPIEC': 'Заказ до 10к/Озон',
     'UC_3W24DF': 'Не рассматривают аналоги',
-    'WON': 'Сделка успешна ✅',
-    'LOSE': 'Сделка провалена ❌',
-    'APOLOGY': 'Спам ❌'
+    'WON': 'Сделка успешна',
+    'LOSE': 'Сделка провалена',
+    'APOLOGY': 'Спам'
 }
 
 def bx(method, params=None):
@@ -140,7 +140,7 @@ def format_money(v):
 
 def format_period(date_from, date_to):
     if not date_from:
-        return 'всё время'
+        return 'все время'
     return f"{date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m.%Y')}"
 
 def find_manager(name, deals):
@@ -153,19 +153,26 @@ def find_manager(name, deals):
             return m
     return None
 
+def sum_revenue(deals_list):
+    return sum(float(d.get('OPPORTUNITY',0) or 0) for d in deals_list)
+
 def manager_report(manager_name, deals, date_from=None, date_to=None):
     filtered = [d for d in deals if manager_name.lower() in d.get('MANAGER','').lower()]
     if date_from:
         filtered = filter_by_period(filtered, date_from, date_to)
 
-    won = [d for d in filtered if d.get('STAGE_ID') in WON_STAGES]
+    won_final = [d for d in filtered if d.get('STAGE_ID') == 'WON']
+    won_shipped = [d for d in filtered if d.get('STAGE_ID') == 'UC_ZWS97R']
+    won_paid = [d for d in filtered if d.get('STAGE_ID') == 'EXECUTING']
+    won = won_final + won_shipped + won_paid
+
     lost = [d for d in filtered if d.get('STAGE_ID') in LOST_STAGES]
     expected = [d for d in filtered if d.get('STAGE_ID') in EXPECTED_STAGES]
     active = [d for d in filtered if d.get('STAGE_ID') not in WON_STAGES + LOST_STAGES]
     missed = [d for d in active if d.get('STAGE_ID') in MISSED_STAGES and days_since(d.get('DATE_CREATE','')) >= 3]
-    
-    revenue = sum(float(d.get('OPPORTUNITY',0) or 0) for d in won)
-    expected_sum = sum(float(d.get('OPPORTUNITY',0) or 0) for d in expected)
+
+    total_revenue = sum_revenue(won)
+    expected_sum = sum_revenue(expected)
     conv = round(len(won) / max(len(filtered), 1) * 100)
 
     stages = {}
@@ -178,9 +185,17 @@ def manager_report(manager_name, deals, date_from=None, date_to=None):
 
     text = f"👤 *{full_name}*\n"
     text += f"📅 Период: {period_str}\n\n"
-    text += f"📊 Всего сделок: {len(filtered)}\n"
-    text += f"💰 Оплачено: {len(won)} ({format_money(revenue)})\n"
-    text += f"⏳ Ожидаем оплату: {len(expected)} ({format_money(expected_sum)})\n"
+    text += f"📊 Всего сделок: {len(filtered)}\n\n"
+
+    text += f"💰 *Оплаты:*\n"
+    text += f"  ✅ Сделка успешна: {len(won_final)} ({format_money(sum_revenue(won_final))})\n"
+    text += f"  📦 Отгружен без документов: {len(won_shipped)} ({format_money(sum_revenue(won_shipped))})\n"
+    text += f"  💳 Счет оплачен: {len(won_paid)} ({format_money(sum_revenue(won_paid))})\n"
+    text += f"  📈 Итого оплат: {len(won)} ({format_money(total_revenue)})\n\n"
+
+    if expected:
+        text += f"⏳ *Ожидаем оплату: {len(expected)}* ({format_money(expected_sum)})\n\n"
+
     text += f"❌ Провалов: {len(lost)}\n"
     text += f"🔄 В работе: {len(active)}\n"
     text += f"📈 Конверсия: {conv}%\n"
@@ -228,31 +243,40 @@ def handle_all(message):
     for d in filtered:
         m = d.get('MANAGER', 'Не назначен')
         if m not in managers:
-            managers[m] = {'won': 0, 'active': 0, 'lost': 0, 'expected': 0, 'revenue': 0, 'expected_sum': 0}
-        if d.get('STAGE_ID') in WON_STAGES:
-            managers[m]['won'] += 1
-            managers[m]['revenue'] += float(d.get('OPPORTUNITY', 0) or 0)
-        elif d.get('STAGE_ID') in LOST_STAGES:
+            managers[m] = {'won_final':0,'won_shipped':0,'won_paid':0,'active':0,'lost':0,'expected':0,'revenue':0,'expected_sum':0}
+        sid = d.get('STAGE_ID')
+        if sid == 'WON':
+            managers[m]['won_final'] += 1
+            managers[m]['revenue'] += float(d.get('OPPORTUNITY',0) or 0)
+        elif sid == 'UC_ZWS97R':
+            managers[m]['won_shipped'] += 1
+            managers[m]['revenue'] += float(d.get('OPPORTUNITY',0) or 0)
+        elif sid == 'EXECUTING':
+            managers[m]['won_paid'] += 1
+            managers[m]['revenue'] += float(d.get('OPPORTUNITY',0) or 0)
+        elif sid in LOST_STAGES:
             managers[m]['lost'] += 1
-        elif d.get('STAGE_ID') in EXPECTED_STAGES:
+        elif sid in EXPECTED_STAGES:
             managers[m]['expected'] += 1
-            managers[m]['expected_sum'] += float(d.get('OPPORTUNITY', 0) or 0)
+            managers[m]['expected_sum'] += float(d.get('OPPORTUNITY',0) or 0)
             managers[m]['active'] += 1
         else:
             managers[m]['active'] += 1
 
     period_str = format_period(date_from, date_to)
     text = f"📊 *Все менеджеры* | {period_str}\n"
-    text += f"Всего сделок: {len(filtered)}\n\n"
+    text += f"Всего: {len(filtered)} сделок\n\n"
 
     for name, s in sorted(managers.items(), key=lambda x: x[1]['revenue'], reverse=True):
-        total = s['won'] + s['active'] + s['lost']
-        conv = round(s['won'] / max(total, 1) * 100)
+        won_total = s['won_final'] + s['won_shipped'] + s['won_paid']
+        total = won_total + s['active'] + s['lost']
+        conv = round(won_total / max(total, 1) * 100)
         text += f"👤 *{name}*\n"
-        text += f"  💰 {s['won']} ({format_money(s['revenue'])})"
+        text += f"  ✅ {s['won_final']} | 📦 {s['won_shipped']} | 💳 {s['won_paid']}"
+        text += f" | 💰 {format_money(s['revenue'])}\n"
         if s['expected'] > 0:
-            text += f" | ⏳ {s['expected']} ({format_money(s['expected_sum'])})"
-        text += f"\n  🔄 {s['active']} | ❌ {s['lost']} | 📈 {conv}%\n\n"
+            text += f"  ⏳ Ожидаем: {s['expected']} ({format_money(s['expected_sum'])})\n"
+        text += f"  🔄 {s['active']} | ❌ {s['lost']} | 📈 {conv}%\n\n"
 
     bot.reply_to(message, text, parse_mode='Markdown')
 
@@ -269,7 +293,7 @@ def handle_expected(message):
         bot.reply_to(message, "✅ Нет сделок в ожидании оплаты!")
         return
 
-    total = sum(float(d.get('OPPORTUNITY',0) or 0) for d in expected)
+    total = sum_revenue(expected)
     period_str = format_period(date_from, date_to)
 
     by_manager = {}
@@ -282,10 +306,10 @@ def handle_expected(message):
     text = f"⏳ *Ожидаемые оплаты* | {period_str}\n"
     text += f"Итого: *{format_money(total)}* ({len(expected)} сделок)\n\n"
 
-    for name, manager_deals in sorted(by_manager.items()):
-        mgr_sum = sum(float(d.get('OPPORTUNITY',0) or 0) for d in manager_deals)
+    for name, mgr_deals in sorted(by_manager.items()):
+        mgr_sum = sum_revenue(mgr_deals)
         text += f"👤 *{name}* — {format_money(mgr_sum)}\n"
-        for d in manager_deals[:5]:
+        for d in mgr_deals[:5]:
             text += f"  • {d.get('TITLE','—')} — {format_money(d.get('OPPORTUNITY',0))}\n"
         text += "\n"
 
@@ -320,7 +344,7 @@ def handle_revenue(message):
     deals = get_deals()
     filtered = filter_by_period(deals, date_from, date_to)
     won = [d for d in filtered if d.get('STAGE_ID') in WON_STAGES]
-    total = sum(float(d.get('OPPORTUNITY',0) or 0) for d in won)
+    total = sum_revenue(won)
 
     by_manager = {}
     for d in won:
